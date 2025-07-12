@@ -1,0 +1,529 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEClient.h>
+#include <unordered_map>
+#include <map>  // Required for std::map
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_MotorShield.h>
+
+// Debug control - comment to disable all serial prints
+//#define DEBUG 0
+
+#ifdef DEBUG
+  #define DEBUG_PRINTLN(x) Serial.println(x)
+  #define DEBUG_PRINTF(fmt, ...) Serial.printf(fmt, ##__VA_ARGS__)
+#else
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_PRINTF(fmt, ...)
+#endif
+
+// Create the motor shield object
+Adafruit_MotorShield AFMS = Adafruit_MotorShield(); 
+
+// Connect two DC motors to M1 and M2
+Adafruit_DCMotor *motorA = AFMS.getMotor(1);
+Adafruit_DCMotor *motorB = AFMS.getMotor(2);
+Adafruit_DCMotor *motorC = AFMS.getMotor(3); 
+
+std::map<const char*, bool> buttonState;  // Track ON/OFF state of buttons
+
+const char* TARGET_NAME = "PG-9156";
+static BLEUUID serviceUUID("00001812-0000-1000-8000-00805f9b34fb");  // HID service
+static BLEUUID charUUID("00002a4d-0000-1000-8000-00805f9b34fb");     // HID report char
+
+bool connected = false;
+BLEClient* pClient = nullptr;
+BLERemoteCharacteristic* pChar = nullptr;
+
+Servo myServo_d;
+Servo myServo_l;
+int servoPin_d = 18;
+int servoPin_l = 2;
+int servoAngle_d = 90;  // Default center position
+int servoAngle_l = 120;  // Default center position
+
+unsigned long pressStartL = 0;
+unsigned long pressStartR = 0;
+unsigned long pressStartY = 0;
+unsigned long pressStartA = 0;
+unsigned long pressStartX = 0;
+unsigned long pressStartB = 0;
+unsigned long pressStartU = 0; 
+unsigned long pressStartD = 0;
+bool isLPressed = false;
+bool isRPressed = false;
+bool isXPressed = false;
+bool isBPressed = false;
+bool isYPressed = false;
+bool isAPressed = false;
+bool isUPressed = false;  // Added for U
+bool isDPressed = false;  // Added for D
+
+const int stepSize = 2;
+const unsigned long stepInterval = 10;  // time in ms between each servo step while holding button
+
+// Motor Control Pins (L9110S)
+unsigned long pressStartL2 = 0;
+unsigned long pressStartR2 = 0;
+bool isL2Pressed = false;
+bool isR2Pressed = false;
+const int lift_motorSpeed = 200;  // PWM value (0-255)
+const int dir_motorSpeed = 180;  // PWM value (0-255)
+
+// Add these global variables
+unsigned long lastSpeedUpdate = 0;
+const int ACCELERATION_RATE = 10; // ms between speed increments
+uint8_t currentSpeed = 0;
+// Add global variable to track the last direction
+uint8_t lastDirection = FORWARD; // FORWARD = 1, BACKWARD = 2
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) override {
+    connected = true;
+    DEBUG_PRINTLN("✅ Connected");
+  }
+  void onDisconnect(BLEClient* pclient) override {
+    connected = false;
+    DEBUG_PRINTLN("🔌 Disconnected - retrying...");
+  }
+};
+
+std::unordered_map<uint32_t, const char*> buttonMap = {
+  // A
+  { 0x3D54F0, "A" },  { 0x30C4EF, "A" },  { 0x2024EF, "A" },  { 0x1074EE, "A" },
+  { 0x33F4EF, "A" },  { 0x2344EF, "A" },  { 0x1394EE, "A" },  { 0x2A84EF, "A" },
+  { 0x16B4EE, "A" },  { 0x2664EF, "A" },  { 0x3714F0, "A" },  { 0x1D04EF, "A" },
+  { 0x0D54EE, "A" },  { 0x1AE4EE, "A" },  { 0x2DA4EF, "A" },  { 0x3A34F0, "A" },
+
+  // B
+  { 0x2D21D7, "B" },  { 0x1951D6, "B" },  { 0x26E1D6, "B" },  { 0x09A1D5, "B" },
+  { 0x1311D6, "B" },  { 0x3361D7, "B" },  { 0x33B1D6, "B" },  { 0x2A01D7, "B" },
+  { 0x0CD1D5, "B" },  { 0x3041D7, "B" },  { 0x1D71D6, "B" },  { 0x0681D5, "B" },
+  { 0x23B1D6, "B" },  { 0x2091D6, "B" },  { 0x10F1D5, "B" },  { 0x1631D6, "B" },
+  { 0x0361D5, "B" },
+
+  { 0x4DB1EC, "X" },  { 0x51E1EC, "X" },  { 0x5401ED, "X" },  { 0x5721ED, "X" },
+  { 0x5A41ED, "X" },  { 0x5E61ED, "X" },  { 0x6181ED, "X" },  { 0x64A1ED, "X" },
+  { 0x67C1ED, "X" },  { 0x6AF1ED, "X" },  { 0x6E11EE, "X" },  { 0x7131EE, "X" },
+  { 0x7451EE, "X" },  { 0x7771EE, "X" },  { 0x7B91EE, "X" },  { 0x7EB1EE, "X" },
+
+  { 0x3D44AD, "D" },  { 0x4064AD, "D" },  { 0x4484AD, "D" },  { 0x47B4AD, "D" },
+  { 0x4AD4AD, "D" },  { 0x4DF4AD, "D" },  { 0x5114AE, "D" },  { 0x5434AE, "D" },
+  { 0x5754AE, "D" },  { 0x5A74AE, "D" },  { 0x5E94AE, "D" },  { 0x61C4AE, "D" },
+  { 0x64E4AE, "D" },  { 0x6704AF, "D" },  { 0x6B24AF, "D" },  { 0x6E44AF, "D" },
+
+  { 0x7B18AA, "U" },  { 0x7E38AA, "U" },  { 0x8158AA, "U" },  { 0x8578AA, "U" },
+  { 0x88A8AA, "U" },  { 0x8BC8AA, "U" },  { 0x8EE8AA, "U" },  { 0x9108AB, "U" },
+  { 0x9528AB, "U" },  { 0x9848AB, "U" },  { 0x9B68AB, "U" },  { 0x9E88AB, "U" },
+  { 0xA2B8AB, "U" },  { 0xA5D8AB, "U" },  { 0xA8F8AB, "U" },  { 0xAB18AC, "U" },
+
+  { 0x9B5170, "L" },  { 0x9E8170, "L" },  { 0xA2A170, "L" },  { 0xA5C170, "L" },
+  { 0xA8E170, "L" },  { 0xAB0171, "L" },  { 0xAF2171, "L" },  { 0xB24171, "L" },
+  { 0xB57171, "L" },  { 0xB89171, "L" },  { 0xBBB171, "L" },  { 0xBFD171, "L" },
+  { 0xC2F171, "L" },  { 0xC51172, "L" },  { 0xC83172, "L" },  { 0xCC5172, "L" },
+
+  { 0x9E1192, "R" },  { 0xA23192, "R" },  { 0xA55192, "R" },  { 0xA87192, "R" },
+  { 0xABA192, "R" },  { 0xAFC192, "R" },  { 0xB2E192, "R" },  { 0xB50193, "R" },
+  { 0xB82193, "R" },  { 0xBB4193, "R" },  { 0xBF6193, "R" },  { 0xC29193, "R" },
+  { 0xC5B193, "R" },  { 0xC8D193, "R" },  { 0xCCF193, "R" },  { 0xCF1194, "R" },
+
+  { 0x6109C7, "L1" },  { 0x6429C7, "L1" },  { 0x6749C7, "L1" },  { 0x6B69C7, "L1" },
+  { 0x6E89C7, "L1" },  { 0x71A9C7, "L1" },  { 0x74D9C7, "L1" },  { 0x78F9C7, "L1" },
+  { 0x7B19C8, "L1" },  { 0x7E39C8, "L1" },  { 0x8159C8, "L1" },  { 0x8579C8, "L1" },
+  { 0x8899C8, "L1" },  { 0x8BC9C8, "L1" },  { 0x8EE9C8, "L1" },  { 0x9209C9, "L1" },
+
+  { 0x8466EF, "L2" },  { 0x8886EF, "L2" },  { 0x8BA6EF, "L2" },  { 0x8EC6EF, "L2" },
+  { 0x91F6EF, "L2" },  { 0x9836F0, "L2" },  { 0x9B56F0, "L2" },  { 0x9E76F0, "L2" },
+  { 0xA296F0, "L2" },  { 0xA5B6F0, "L2" },  { 0xA8D6F0, "L2" },  { 0xAB06F1, "L2" },
+  { 0xAF26F1, "L2" },  { 0xB246F1, "L2" },  { 0x9516F0, "L2" },  { 0xB566F1, "L2" },
+
+  { 0xB28616, "R2" },  { 0xB5A616, "R2" },  { 0xB8C616, "R2" },  { 0xE28618, "R2" },
+  { 0xBCE616, "R2" },  { 0xBF0617, "R2" },  { 0xC23617, "R2" },  { 0xC55617, "R2" },
+  { 0xC97617, "R2" },  { 0xCC9617, "R2" },  { 0xCFB617, "R2" },  { 0xD2D617, "R2" },
+  { 0xD6F617, "R2" },  { 0xD92618, "R2" },  { 0xDC4618, "R2" },  { 0xDF6618, "R2" },
+
+  // Y
+  { 0x412DF5, "Y" },  { 0x1A8DF3, "Y" },  { 0x37BDF4, "Y" },  { 0x3DADF4, "Y" },
+  { 0x102DF3, "Y" },  { 0x20CDF3, "Y" },  { 0x349DF4, "Y" },  { 0x2A3DF3, "Y" },
+  { 0x0ADDF4, "Y" },  { 0x2A3DF4, "Y" },  { 0xDC4618, "Y" },  { 0x3DADF3, "Y" },
+  { 0x1DADF3, "Y" },  { 0x307DF4, "Y" },  { 0x23FDF3, "Y" },  { 0x344DF3, "Y" },
+  { 0x134DF3, "Y" },  { 0x3D0DF5, "Y" },  { 0x0A3DF4, "Y" },  { 0x27BDF4, "Y" },
+  { 0x2D5DF4, "Y" },  { 0x3A3DF4, "Y" },  { 0x002DF3, "Y" },  { 0x13ADF3, "Y" },
+  { 0x0016F3, "Y" },  { 0x30CDF3, "Y" },  { 0x13FDF3, "Y" },  { 0x271DF4, "Y" },
+  { 0x166DF3, "Y" },  { 0x3ADDF4, "Y" }
+
+};
+
+void stopMotors() {
+  motorA->setSpeed(0);
+  motorA->run(RELEASE);
+  motorB->setSpeed(0);
+  motorB->run(RELEASE);
+}
+
+void forwardMotors(uint8_t speed) {
+  motorA->setSpeed(speed);
+  motorA->run(FORWARD);
+  motorB->setSpeed(speed);
+  motorB->run(FORWARD);
+}
+
+void backwardMotors(uint8_t speed) {
+  motorA->setSpeed(speed);
+  motorA->run(BACKWARD);
+  motorB->setSpeed(speed);
+  motorB->run(BACKWARD);
+}
+
+void leftTurn_f(uint8_t speed) {
+  motorA->setSpeed(speed/2);  // Slow down left wheel
+  motorA->run(FORWARD);
+  motorB->setSpeed(speed);
+  motorB->run(FORWARD);
+}
+
+void leftTurn_b(uint8_t speed) {
+  motorA->setSpeed(speed/2);  // Slow down left wheel
+  motorA->run(BACKWARD);
+  motorB->setSpeed(speed);
+  motorB->run(BACKWARD);
+}
+
+void onlyleftTurn(uint8_t speed) {
+  motorA->setSpeed(speed); 
+  motorA->run(FORWARD);
+  motorB->setSpeed(speed);
+  motorB->run(BACKWARD);
+}
+
+void rightTurn_f(uint8_t speed) {
+  motorA->setSpeed(speed);
+  motorA->run(FORWARD);
+  motorB->setSpeed(speed/2);  // Slow down right wheel
+  motorB->run(FORWARD);
+}
+
+void rightTurn_b(uint8_t speed) {
+  motorA->setSpeed(speed);
+  motorA->run(BACKWARD);
+  motorB->setSpeed(speed/2);  // Slow down right wheel
+  motorB->run(BACKWARD);
+}
+
+void onlyrightTurn(uint8_t speed) {
+  motorA->setSpeed(speed);
+  motorA->run(BACKWARD);
+  motorB->setSpeed(speed); 
+  motorB->run(FORWARD);
+}
+
+void decodeButton(uint8_t* data) {
+  uint8_t statusByte = data[0];
+  uint32_t key = (data[1] << 16) | (data[2] << 8) | data[3];
+  auto it = buttonMap.find(key);
+  if (it == buttonMap.end()) return;
+
+  const char* label = it->second;
+  bool isPress = (statusByte == 0x03 || statusByte == 0x13);
+  bool isRelease = (statusByte == 0x02 || statusByte == 0x12);
+
+  if (!connected) return;
+
+  if (isPress && !buttonState[label]) {
+    buttonState[label] = true;
+    DEBUG_PRINTF("🎮 Button %s → ON\n", label);
+
+    if (strcmp(label, "L") == 0) {
+      pressStartL = millis();
+      isLPressed = true;
+    }
+    if (strcmp(label, "R") == 0) {
+      pressStartR = millis();
+      isRPressed = true;
+    }
+    if (strcmp(label, "X") == 0) {
+      pressStartX = millis();
+      isXPressed = true;
+    }
+    if (strcmp(label, "B") == 0) {
+      pressStartB = millis();
+      isBPressed = true;
+    }
+    if (strcmp(label, "Y") == 0) {
+      pressStartY = millis();
+      isYPressed = true;
+    }
+    if (strcmp(label, "A") == 0) {
+      pressStartA = millis();
+      isAPressed = true;
+    }
+    if (strcmp(label, "L2") == 0) {
+      pressStartL2 = millis();
+      isL2Pressed = true;
+    }
+    if (strcmp(label, "R2") == 0) {
+      pressStartR2 = millis();
+      isR2Pressed = true;
+    }
+      if (strcmp(label, "U") == 0) {
+      pressStartU = millis();
+      isUPressed = true;
+    }
+    if (strcmp(label, "D") == 0) {
+      pressStartD = millis();
+      isDPressed = true;
+    }
+  }
+
+  if (isRelease && buttonState[label]) {
+    buttonState[label] = false;
+    DEBUG_PRINTF("🎮 Button %s → OFF\n", label);
+
+    if (strcmp(label, "L") == 0 && isLPressed) {
+      isLPressed = false;
+    }
+    if (strcmp(label, "R") == 0 && isRPressed) {
+      isRPressed = false;
+    }
+    if (strcmp(label, "X") == 0 && isXPressed) {
+      isXPressed = false;
+    }
+    if (strcmp(label, "B") == 0 && isBPressed) {
+      isBPressed = false;
+    }
+    if (strcmp(label, "Y") == 0 && isYPressed) {
+      isYPressed = false;
+    }
+    if (strcmp(label, "A") == 0 && isAPressed) {
+      isAPressed = false;
+    }
+    if (strcmp(label, "L2") == 0 && isL2Pressed) {
+      isL2Pressed = false;
+    }
+    if (strcmp(label, "R2") == 0 && isR2Pressed) {
+      isR2Pressed = false;
+    }
+    if (strcmp(label, "U") == 0) {
+      isUPressed = false;
+    }
+    if (strcmp(label, "D") == 0) {
+      isDPressed = false;
+    }
+  }
+}
+
+const char* getDirection(uint8_t x, uint8_t y) {
+  if (x >= 3 && x <= 4 && y >= 3 && y <= 4) return "i";  // idle
+
+  if (x <= 2 && y <= 2) return "ul";  // up-left
+  if (x >= 5 && y <= 2) return "ur";  // up-right
+  if (x <= 2 && y >= 5) return "dl";  // down-left
+  if (x >= 5 && y >= 5) return "dr";  // down-right
+
+  if (x <= 2) return "l";
+  if (x >= 5) return "r";
+  if (y <= 2) return "u";
+  if (y >= 5) return "d";
+
+  return "idle";  // default
+}
+
+void decodeJoystick(const uint8_t* data, size_t len) {
+  if (len < 4) return;
+
+  uint8_t lx = data[1];  // Left Stick X
+  uint8_t ly = data[2];  // Left Stick Y
+  uint8_t rx = data[3];  // Right Stick X
+
+  // Map values to 0–7 range
+  uint8_t lxMap = map(lx, 0, 255, 0, 7);
+  uint8_t lyMap = map(ly, 0, 255, 7, 0);
+  uint8_t rxMap = map(rx, 0, 255, 0, 7);  // assuming Y for right stick is not transmitted
+
+  // Direction decode
+  const char* leftDir = getDirection(lxMap, lyMap);
+  const char* rightDir = "i";
+  if (rx < 100) rightDir = "JOYSTICK L";
+  else if (rx > 120) rightDir = "JOYSTICK R";
+
+  DEBUG_PRINTF(" (X , Y): (%3d, %3d) → %s | 🕹️ : %s\n", lx, ly, leftDir, rightDir);
+}
+
+void notifyCallback(
+  BLERemoteCharacteristic* pBLERemoteCharacteristic,
+  uint8_t* pData,
+  size_t length,
+  bool isNotify
+) {
+  uint32_t key = (pData[1] << 16) | (pData[2] << 8) | pData[3];
+  auto it = buttonMap.find(key);
+
+  if (it != buttonMap.end()) {
+    decodeButton(pData);  // Only decode button if match found
+  } else {
+    decodeJoystick(pData, length);  // Otherwise only decode joystick
+  }
+}
+
+void connectToController() {
+  DEBUG_PRINTLN("🔍 Scanning for PG-9156...");
+
+  BLEScan* pScan = BLEDevice::getScan();
+  pScan->setActiveScan(true);
+  BLEScanResults results = *pScan->start(5, false);
+
+  BLEAdvertisedDevice* target = nullptr;
+  for (int i = 0; i < results.getCount(); ++i) {
+    BLEAdvertisedDevice dev = results.getDevice(i);
+    if (dev.getName() == TARGET_NAME) {
+      target = new BLEAdvertisedDevice(dev);
+      break;
+    }
+  }
+
+  if (!target) {
+    DEBUG_PRINTLN("❌ Controller not found.");
+    return;
+  }
+
+  pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+
+  if (!pClient->connect(target)) {
+    DEBUG_PRINTLN("❌ Failed to connect.");
+    return;
+  }
+
+  DEBUG_PRINTLN("✅ Connected to device");
+
+  BLERemoteService* pService = pClient->getService(serviceUUID);
+  if (!pService) {
+    DEBUG_PRINTLN("❌ Controller not found.");
+    return;
+  }
+
+  pChar = pService->getCharacteristic(charUUID);
+  if (!pChar) {
+    DEBUG_PRINTLN("❌ Characteristic not found.");
+    return;
+  }
+
+  if (pChar->canNotify()) {
+    pChar->registerForNotify(notifyCallback);
+
+    // Enable CCCD notifications
+    auto cccd = pChar->getDescriptor(BLEUUID((uint16_t)0x2902));
+    if (cccd) {
+      uint8_t val[2] = { 0x01, 0x00 };
+      cccd->writeValue(val, 2);
+    }
+
+    DEBUG_PRINTF("📡 Notifications enabled for: %s\n", charUUID.toString().c_str());
+    DEBUG_PRINTLN("📡 Notifications setup complete. Press controller buttons.");
+  }
+}
+
+void setup() {
+
+  Serial.begin(115200);
+  BLEDevice::init("ESP32_Controller");
+
+  myServo_d.setPeriodHertz(50);      // Standard 50Hz for SG90
+  myServo_d.attach(servoPin_d, 500, 2400); // Min/max pulse width in microseconds
+  servoAngle_d = 120;
+  myServo_d.write(servoAngle_d);
+  myServo_l.setPeriodHertz(50);      // Standard 50Hz for SG90
+  myServo_l.attach(servoPin_l, 500, 2400); // Min/max pulse width in microseconds
+  servoAngle_l = 120;
+  myServo_l.write(servoAngle_l);
+  DEBUG_PRINTLN("🚀 Steering Servo Reset to center");
+
+  // Initialize motor shield
+  if (!AFMS.begin()) {
+    DEBUG_PRINTLN("Could not find Motor Shield. Check wiring.");
+    while (1);
+  }
+  DEBUG_PRINTLN("Motor Shield ready!");
+  
+  connectToController();
+}
+
+void loop() {
+
+  if (!connected) {
+    delay(3000);
+    connectToController();
+    return;
+  }
+
+  // Handle Y and A for servo_d
+  if (isYPressed && (millis() - pressStartY >= stepInterval)) {
+    pressStartY = millis();
+    if (servoAngle_d + stepSize <= 180) {
+      servoAngle_d += stepSize;
+      myServo_d.write(servoAngle_d);
+      DEBUG_PRINTF("⏳ Holding Y → angle_d: %d\n", servoAngle_d);
+    }
+  }
+  if (isAPressed && (millis() - pressStartA >= stepInterval)) {
+    pressStartA = millis();
+    if (servoAngle_d - stepSize >= 0) {
+      servoAngle_d -= stepSize;
+      myServo_d.write(servoAngle_d);
+      DEBUG_PRINTF("⏳ Holding A → angle_d: %d\n", servoAngle_d);
+    }
+  }
+
+  // Handle X and B for servo_l
+  if (isXPressed && (millis() - pressStartX >= stepInterval)) {
+    pressStartX = millis();
+    if (servoAngle_l + stepSize <= 180) {
+      servoAngle_l += stepSize;
+      myServo_l.write(servoAngle_l);
+      DEBUG_PRINTF("⏳ Holding X → angle_l: %d\n", servoAngle_l);
+    }
+  }
+  if (isBPressed && (millis() - pressStartB >= stepInterval)) {
+    pressStartB = millis();
+    if (servoAngle_l - stepSize >= 45) {
+      servoAngle_l -= stepSize;
+      myServo_l.write(servoAngle_l);
+      DEBUG_PRINTF("⏳ Holding B → angle_l: %d\n", servoAngle_l);
+    }
+  }
+
+  // Handle L2 and R2 with safety delay for direction changes
+  if (isL2Pressed && isLPressed==0 && isRPressed==0) {
+    forwardMotors(dir_motorSpeed);
+  } else if (isR2Pressed && isLPressed==0 && isRPressed==0) {
+    backwardMotors(dir_motorSpeed);
+  } else if (isLPressed && isL2Pressed==0 && isR2Pressed==0) {
+    onlyleftTurn(dir_motorSpeed);
+  } else if (isRPressed && isL2Pressed==0 && isR2Pressed==0) {
+    onlyrightTurn(dir_motorSpeed);
+  } else if (isL2Pressed && isLPressed && isRPressed==0) {
+    rightTurn_f(dir_motorSpeed);
+  } else if (isL2Pressed && isLPressed==0 && isRPressed) {
+    leftTurn_f(dir_motorSpeed);
+  } else if (isR2Pressed && isLPressed==0 && isRPressed) {
+    rightTurn_b(dir_motorSpeed);
+  } else if (isR2Pressed && isLPressed && isRPressed==0) {
+    leftTurn_b(dir_motorSpeed);
+  } else {
+    stopMotors();
+  }
+
+  if (isUPressed) {
+    motorC->setSpeed(lift_motorSpeed);
+    motorC->run(FORWARD);
+  } else if (isDPressed) {
+    motorC->setSpeed(lift_motorSpeed);
+    motorC->run(BACKWARD);
+  } else {
+    motorC->setSpeed(0);
+    motorC->run(RELEASE);
+  }
+
+  delay(5);
+}
